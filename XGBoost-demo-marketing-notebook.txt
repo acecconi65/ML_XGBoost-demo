@@ -1,0 +1,235 @@
+=============================================================================================================================================================
+1 - PRE-PROCESSING
+=============================================================================================================================================================
+
+pip -q install --upgrade pip
+pip -q install sagemaker awscli boto3 smdebug --upgrade
+pip -q install numpy pandas matplotlib seaborn --upgrade
+
+from IPython.core.display import HTML
+HTML(".................")
+
+!wget -N https://archive.ics.uci.edu/ml/machine-learning-databases/00222/bank-additional.zip
+!unzip -o bank-additional.zip!head ./bank-additional/bank-additional-full.csv
+
+#Then we need to load this CSV file, inspect it, pre-process it, etc.
+#Devs tipically do it not writing some custom Python code but using libraries such as Pandas, Numpy
+
+import numpy as np
+import pandas as pd
+
+data = pd.read_csv('./bank-additional/bank-additional-full.csv',sep=';')
+pd.set_option('display.max_columns', 500)
+pd.set_option('display.max_rows',50)
+
+data.shape
+
+#The two classes are extremely unbalanced and it could be a problem for our classifier
+
+one_class = data[data['y']=='yes']
+one_class_count = one_class.shape[0]
+print("Positive samples: %d" % one_class_count)
+zero_class = data[data['n']=='no']
+zero_class_count = zero_class.shape[0]
+print("Negative samples: %d" % zero_class_count)
+zero_to_one_ratio = zero_class_count/one_class_count
+
+#Transforming the dataset: cleaning up data is a part of every ML project and presents the biggest risk if 
+#done incorrectly.
+#Many records have the value of "999" for pdays, number of days that passed by after a client was last contacted.
+#It should represent that no contact was made before: a new column "no_previous_contact" will have value "1" when
+#pdays is 999 and 0 otherwise
+
+[np.min(data['pdays']), np.max(data['pdays'])]
+
+data["no_previous_contact"] = np.where(data['pdays'] == 999, 1, 0)
+data = data.drop(['pdays']. axis=1)
+
+#In the "job" column, there are categories that mean the customer is not working, e.g. "student","retire",
+#"unemployed". Since it is very likely whether or not a customer is working will affect his/her decision
+#to enroll in the term deposit, we generate a new column to show whether the customer is working based
+#on "job" column
+data['job'].value_counts()
+
+#Indicator for individuals not actively employed: new column
+data['not_working'] = np.where(np.inld(data['job'], ['student','retired','unemployed']),1,
+
+#Convert categorical to numeric
+model_data = pd.get_dummies(data)
+model_data[:10]
+
+#Alla fine avremo 67 invece di 21 colonne (one hot encoding)
+model_data.shape
+
+#Then we split the dataset into training (70%), validation (20%) and test (10%) e then convert the datasets
+#to the right format the algo expects:
+#Set the seeds to 123 for reproducibility
+train_data, validation_data, test_data = np.split(model_data.sample(frac=1, random_state=123)
+												[int(0.7 = len(model_data)), int(0.9=len(mo
+
+#Drop the two columns for 'yes' and 'no' and add 'yes' back as first column of the dataframe
+pd.concat([train_data['y_yes'], train_data.drop(['y_no', 'y_yes'], axis=1).to_csv('train.csv', index=False, header=False)
+pd.concat([validation_data['y_yes'], validation_data.drop(['y_no', 'y_yes'], axis=1).to_csv('validation.csv', index=False, header=False)
+
+#Dropping the target value as we will use this CSV file for batch transform
+test_data.drop(['y_no', 'y_yes'], axis=1).to_csv('test.csv', index=False, header=False)
+
+!ls -l *.csv
+automl-test.csv
+automl-train.csv
+test.csv
+train.csv
+validation.csv
+
+#Copying the files to S3 for SageMaker training to pickup:
+import sagemaker
+import boto3, os
+
+print(sagemaker.__version__)
+bucket = sagemaker.Session().default_bucket()
+prefix = 'sagemaker/DEMO-xgboost-dm'
+
+boto3.Session().resource('s3').Bucket(bucket).Object(os.path.join(prefix, 'train/train.csv')).u
+boto3.Session().resource('s3').Bucket(bucket).Object(os.path.join(prefix, 'validation/validation.csv')).u
+boto3.Session().resource('s3').Bucket(bucket).Object(os.path.join(prefix, 'test/test.csv')).uci
+
+#SageMaker needs to know where the training and validation sets are located:
+s3_input_train = sagemaker.s3_input(s3_data='s3://{}/{}/train'.format(bucket, prefix), content
+s3_input_validation = sagemaker.s3_input(s3_data='s3://{}/{}/validation'.format(bucket, prefix), content
+s3_data = {'train':s3_input_train, 'validation': s3_input_validation}
+
+=============================================================================================================================================================
+2 - TRAINING THE MODEL
+=============================================================================================================================================================
+from sagemaker.amazon.amazon_estimator import get_image_uri
+from sagemaker.estimator import Estimator
+from sagemaker.debugger import rule_configs, Rule, DebuggerHookConfig, CollectionConfig
+
+sess = sagemaker.Session()
+region = boto3.Session().region_name
+
+container = get_image_uri(region, 'xgboost', repo_version='0.90-2')
+save_interval = '1'
+xgb = Estimator(
+	container,													# the algo (XGBoost)
+	role=sagemaker.get_execution_role(),						# IAM permissions for SageMaker
+	sagemaker_session=sess,										# technical object
+	input_mode='File',											# Copy the dataset and the train
+	output_path='s3://{}/{}/output'.format(bucket, prefix),		# Save the model here
+	train_instance_count=1,										# Instance requirements
+	train_instance_type='ml.m4.2xlarge',
+	train_use_spot_instances=True,
+	train_max_run=300,
+	train_max_wait=600,
+	
+	debugger_hook_config=DebuggerHookConfig(					# E' il debugger di SageMaker, attivabile durante il training
+																# it looks at the internal state of the model, vediamo in che modo sta apprendendo
+																# e salva lo stato nei tensori su S3
+																# i tensori che uso sono due: metrics e feature_importance
+		s3_output_path='s3://{}/{}/debug'.format(bucket, prefix),
+		collection_configs=[
+			CollectionConfig(
+				name="metrics",
+				parameters={
+					"save_interval": save_interval
+				}
+			),
+			CollectionConfig(
+				name="feature_importance",
+				parameters={
+					"save_interval": save_interval
+				}
+			)
+		],
+	},
+	
+	rules=[
+		Rule.sagemaker(												# Configure debugger rule
+																	# sto chiedendo al debugger di controllare questa rule: la class imbalance:
+																	# quanto impatta la class imbalance sulle performance del modello?
+																	# quanto mi porta a errate predizioni?
+																	# qui stiamo usando un default
+			rule_configs.class_imbalance(),
+			rule_parameters={
+				"collection_names": "metrics"
+			},
+		),
+	]
+			
+#Setting hyper parameters:
+
+#each built-in algo has a set of hyperparameters
+#Let's stick to 3 simple parameters:
+# - Build a binary classifier: 'binary:logistic'
+# - Use the 'Area Under Curve' (auc) metric, a good metric for classifiers
+# - Train for 100 rounds, with early stopping if the metric hasn't improved in 10 rounds
+xgb.set_hyperparameters(
+	objective='binary:logistic'.)
+	eval_metric='auc'.
+	num_round=100,
+	early_stopping_rounds=10
+)
+
+xgb.fit(s3_data)
+
+#partono in parallelo sia il training che il debug
+#da notare, alla fine, il risparmio per aver usato delle spot instances
+#quando termina, vediamo lo stato del job di debug
+xgb.latest_training_job.rule_job_summary()
+
+#carichiamo i tensori salvati durante il training e plottiamoli
+import smdebug
+from smdebug.trials import create_trial
+s3_output_path = xgb.latest_job_debugger_artifacts_path()		#acquisisco il path dove il debug è stato salvato
+trial = create_trial(s3_output_path)							#e creo un trial
+
+#Let's plot our metric over time
+import matplotlib.pyplot as plt
+import seaborn as sns
+import re
+
+def get_data(trial, tname):
+	#for the given tensor name, walks though all the iterations
+	#for which you have data and fetches the values
+	#returns the set of steps and the values
+	tensor = trial.tensor(tname)
+	steps = tensor.steps()
+	vals = [tensor.value(s) for s in steps]
+	return steps, vals
+	
+def plot_collection(trial, collection_name, regex='.=',figsize=(8,6)):
+	#takes a 'trial' and a collection name, and
+	#plots all tensors that match the given regex
+	fig, ax = plt.subplots(figsize=figsize)
+	sns.dedespine()
+	
+	tensors = trial.collection(collection_name).tensor_names
+	
+	for tensor_name in sorted(tensors):
+		if re.match(regex, tensor_name):
+			steps, data = get_data(trial, tensor_name)
+			ax.plot(steps, data, label=tensor_name)
+	ax.legend(loc='center left', bbox_to_anchir=(1, 0.5))
+	ax.set_xlabel('Iteration')
+	
+plot_collection(trial, "metrics")
+	
+=============================================================================================================================================================
+3 - DEPLOYING THE MODEL
+=============================================================================================================================================================
+#Deploy the model to a HTTPS endpoint and enable data capture. All it takes is one line of code.
+from sagemaker.model_monitor.data_capture_config import DataCaptureConfig
+
+from time import strftime, gmtime
+timestamp = strftime('%d-%H-%M-%S', gmtime())
+
+capture_path = 's3://{}/{}/capture'.format(bucket, prefix)
+
+
+
+
+
+
+
+
+
